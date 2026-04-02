@@ -1,0 +1,24 @@
+# Core runtime dependencies
+numpy==2.4.4
+pandas==3.0.2
+python-dotenv==1.2.2
+requests==2.33.1
+lxml==6.0.2
+psycopg2-binary==2.9.11
+openai==2.30.0
+
+# Ethereum / Hyperliquid
+hyperliquid-python-sdk==0.22.0
+eth-account==0.13.7
+eth-abi==5.2.0
+parsimonious==0.10.0
+
+# Forecasting
+prophet==1.3.0
+
+# Calibration / ML
+scikit-learn==1.8.0
+
+# Optional technical-indicator library
+# Kept available for compatibility, but the v1 skeleton prefers internal calculations.
+ta==0.11.0

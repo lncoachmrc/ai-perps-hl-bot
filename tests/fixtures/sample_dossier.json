@@ -1,0 +1,7 @@
+{
+  "asset": "BTC",
+  "market_state": {"mark_price": 0.0},
+  "quant_expert": {"setup_score": 0.0},
+  "prophet_expert": {"trend_bias": "neutral"},
+  "news_expert": {"impact": "low"}
+}

@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import asdict, is_dataclass
+from enum import Enum
+from typing import Any, Dict
+
+from app.experts.dossier.builder import DecisionDossierBuilder
+from app.experts.news.news_expert import NewsExpert
+from app.experts.prophet.prophet_expert import ProphetExpert
+from app.experts.quant.quant_expert import QuantExpert
+from app.exchange.hyperliquid.client import HyperliquidClient
+from app.llm.judge import JudgeLLM
+from app.risk.risk_gate import RiskGate
+from app.services.journal_service import JournalService
+from app.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _fmt_num(value: Any, digits: int = 2, fallback: str = "n/a") -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _fmt_bool(value: Any) -> str:
+    return "yes" if bool(value) else "no"
+
+
+def _fmt_list(values: Any, fallback: str = "none") -> str:
+    if not values:
+        return fallback
+    if isinstance(values, (list, tuple, set)):
+        return ", ".join(str(item) for item in values)
+    return str(values)
+
+
+def _decision_value(action: Any) -> str:
+    if isinstance(action, Enum):
+        return str(action.value)
+    return str(action)
+
+
+def _decision_emoji(action: str) -> str:
+    mapping = {
+        "NO_TRADE": "⏸️",
+        "HOLD": "🟡",
+        "ENTER_LONG": "🟢",
+        "ENTER_SHORT": "🔴",
+        "REDUCE": "📉",
+        "CLOSE": "🚪",
+    }
+    return mapping.get(action, "🤖")
+
+
+def _mode_label(settings: Settings) -> str:
+    if settings.dry_run:
+        return "dry-run"
+    if settings.shadow_mode:
+        return "shadow"
+    return "live"
+
+
+class Orchestrator:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.exchange = HyperliquidClient(dry_run=settings.dry_run, shadow_mode=settings.shadow_mode)
+        self.quant = QuantExpert()
+        self.prophet = ProphetExpert()
+        self.news = NewsExpert()
+        self.builder = DecisionDossierBuilder()
+        self.judge = JudgeLLM(enabled=bool(settings.openai_api_key), model=settings.openai_model)
+        self.risk_gate = RiskGate(settings)
+        self.journal = JournalService()
+        self._last_status = {"status": "booting", "loop_count": 0}
+
+    def status(self) -> Dict[str, object]:
+        return self._last_status
+
+    def run_forever(self) -> None:
+        logger.info(
+            "🚀 Orchestrator started | env=%s | mode=%s | dry_run=%s | shadow_mode=%s | "
+            "symbols=%s | loop_interval=%ss | llm_enabled=%s | llm_model=%s",
+            self.settings.app_env,
+            _mode_label(self.settings),
+            self.settings.dry_run,
+            self.settings.shadow_mode,
+            ",".join(self.settings.universe_symbols),
+            self.settings.loop_interval_seconds,
+            _fmt_bool(bool(self.settings.openai_api_key)),
+            self.settings.openai_model,
+        )
+        self._last_status["status"] = "running"
+        while True:
+            self.run_once()
+            time.sleep(self.settings.loop_interval_seconds)
+
+    def run_once(self) -> None:
+        next_loop = int(self._last_status.get("loop_count", 0)) + 1
+        logger.info("🔁 Starting decision loop #%s", next_loop)
+
+        account_state = self.exchange.get_account_state()
+        open_positions = account_state.get("open_positions", [])
+        open_positions_count = len(open_positions) if isinstance(open_positions, list) else 0
+        logger.info(
+            "💼 Account snapshot | equity=%s | available_margin=%s | open_positions=%s",
+            _fmt_num(account_state.get("equity")),
+            _fmt_num(account_state.get("available_margin")),
+            open_positions_count,
+        )
+
+        for asset in self.settings.universe_symbols:
+            logger.info("🪙 %s | Starting asset review", asset)
+
+            market = self.exchange.get_market_snapshot(asset)
+            logger.info(
+                "📈 %s | Market snapshot | mark_price=%s | spread_bps=%s | funding_rate=%s | "
+                "open_interest_delta_1h=%s | regime_hint=%s",
+                asset,
+                _fmt_num(market.get("mark_price")),
+                _fmt_num(market.get("spread_bps")),
+                _fmt_num(market.get("funding_rate"), digits=4),
+                _fmt_num(market.get("open_interest_delta_1h"), digits=4),
+                market.get("regime_hint", "unknown"),
+            )
+
+            quant_view = self.quant.evaluate(market)
+            logger.info(
+                "🧠 %s | Quant expert | regime=%s | setup_score=%s | p_up=%s | p_down=%s | "
+                "expected_move_60m=%s | invalidation_price=%s",
+                asset,
+                quant_view.get("regime", "unknown"),
+                _fmt_num(quant_view.get("setup_score")),
+                _fmt_num(quant_view.get("p_up")),
+                _fmt_num(quant_view.get("p_down")),
+                _fmt_num(quant_view.get("expected_move_60m")),
+                _fmt_num(quant_view.get("invalidation_price")),
+            )
+
+            prophet_view = self.prophet.evaluate(market)
+            logger.info(
+                "🔮 %s | Prophet expert | trend_bias=%s | forecast_delta_4h=%s | "
+                "interval_width=%s | changepoint_stress=%s",
+                asset,
+                prophet_view.get("trend_bias", "unknown"),
+                _fmt_num(prophet_view.get("forecast_delta_4h")),
+                prophet_view.get("interval_width", "unknown"),
+                prophet_view.get("changepoint_stress", "unknown"),
+            )
+
+            news_view = self.news.evaluate(asset)
+            logger.info(
+                "📰 %s | News expert | impact=%s | direction=%s | headline_conflict=%s | "
+                "tradability_flag=%s | freshness_minutes=%s",
+                asset,
+                news_view.get("impact", "unknown"),
+                news_view.get("direction", "unknown"),
+                news_view.get("headline_conflict", False),
+                news_view.get("tradability_flag", "unknown"),
+                news_view.get("freshness_minutes", "n/a"),
+            )
+
+            dossier = self.builder.build(
+                asset=asset,
+                market_state=market,
+                quant_expert=quant_view,
+                prophet_expert=prophet_view,
+                news_expert=news_view,
+                position_state={"side": "flat", "asset": asset},
+                execution_context={
+                    "preferred_order_type": "IOC",
+                    "slippage_estimate_bps": 2.0,
+                    "fee_estimate_bps": 4.0,
+                },
+            )
+            logger.info(
+                "🧾 %s | Dossier ready | timestamp=%s | position_side=%s | order_type=%s | "
+                "slippage_bps=%s | fee_bps=%s",
+                asset,
+                dossier.timestamp,
+                dossier.position_state.get("side", "unknown"),
+                dossier.execution_context.get("preferred_order_type", "unknown"),
+                _fmt_num(dossier.execution_context.get("slippage_estimate_bps")),
+                _fmt_num(dossier.execution_context.get("fee_estimate_bps")),
+            )
+
+            decision = self.judge.decide(dossier.to_dict())
+            decision_action = _decision_value(decision.action)
+            logger.info(
+                "%s %s | Judge decision | action=%s | confidence=%s | size_multiplier=%s | "
+                "ttl_minutes=%s | stop_logic=%s | take_profit_logic=%s | reasons=%s",
+                _decision_emoji(decision_action),
+                asset,
+                decision_action,
+                _fmt_num(decision.confidence),
+                _fmt_num(decision.size_multiplier),
+                decision.ttl_minutes,
+                decision.stop_logic,
+                decision.take_profit_logic,
+                _fmt_list(decision.reasons),
+            )
+
+            gate = self.risk_gate.evaluate(asset, decision, account_state)
+            logger.info(
+                "🛡️ %s | Risk gate verdict | allowed=%s | final_action=%s | final_size=%s | reason=%s",
+                asset,
+                gate.allowed,
+                gate.final_action,
+                _fmt_num(gate.final_size_multiplier),
+                gate.reason,
+            )
+
+            if gate.allowed and gate.final_action not in {"NO_TRADE", "HOLD"}:
+                logger.info(
+                    "📤 %s | Sending order to execution layer | action=%s | size_multiplier=%s | mode=%s",
+                    asset,
+                    gate.final_action,
+                    _fmt_num(gate.final_size_multiplier),
+                    _mode_label(self.settings),
+                )
+                execution_result = self.exchange.place_order(
+                    {
+                        "asset": asset,
+                        "action": gate.final_action,
+                        "size_multiplier": gate.final_size_multiplier,
+                        "dry_run": self.settings.dry_run,
+                        "shadow_mode": self.settings.shadow_mode,
+                    }
+                )
+                logger.info(
+                    "✅ %s | Execution result | accepted=%s | mode=%s | simulated=%s | sent_to_exchange=%s | order_status=%s | error=%s",
+                    asset,
+                    execution_result.get("accepted", False),
+                    execution_result.get("mode", _mode_label(self.settings)),
+                    execution_result.get("simulated", self.settings.dry_run or self.settings.shadow_mode),
+                    execution_result.get("sent_to_exchange", False),
+                    execution_result.get("order_status", "unknown"),
+                    execution_result.get("error", ""),
+                )
+            else:
+                logger.info(
+                    "⏭️ %s | No order sent | allowed=%s | final_action=%s | reason=%s",
+                    asset,
+                    gate.allowed,
+                    gate.final_action,
+                    gate.reason,
+                )
+
+            self.journal.append(
+                {
+                    "asset": asset,
+                    "dossier": dossier.to_dict(),
+                    "decision": _jsonable(decision),
+                    "risk_gate": _jsonable(gate),
+                }
+            )
+            logger.info("📝 %s | Journal entry written", asset)
+
+        self._last_status["loop_count"] = next_loop
+        logger.info("🏁 Decision loop #%s completed", next_loop)
