@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timezone
 from typing import Any, Dict
 
 import pandas as pd
@@ -81,6 +80,41 @@ class QuantExpert:
             limit=limit,
             logger=logger,
         )
+
+    def _ema(self, data: pd.Series, period: int) -> pd.Series:
+        series = data.astype(float)
+        if ta is not None:
+            try:
+                return ta.trend.ema_indicator(close=series, window=period, fillna=False)
+            except Exception:
+                logger.debug("Quant expert EMA via ta failed | period=%s | using fallback", period, exc_info=True)
+        return _ema_fallback(series, period)
+
+    def _rsi(self, data: pd.Series, period: int) -> pd.Series:
+        series = data.astype(float)
+        if ta is not None:
+            try:
+                return ta.momentum.rsi(close=series, window=period, fillna=False)
+            except Exception:
+                logger.debug("Quant expert RSI via ta failed | period=%s | using fallback", period, exc_info=True)
+        return _rsi_fallback(series, period)
+
+    def _atr(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+        high_s = high.astype(float)
+        low_s = low.astype(float)
+        close_s = close.astype(float)
+        if ta is not None:
+            try:
+                return ta.volatility.average_true_range(
+                    high=high_s,
+                    low=low_s,
+                    close=close_s,
+                    window=period,
+                    fillna=False,
+                )
+            except Exception:
+                logger.debug("Quant expert ATR via ta failed | period=%s | using fallback", period, exc_info=True)
+        return _atr_fallback(high_s, low_s, close_s, period)
 
     def _fallback(self, market_snapshot: Dict[str, Any]) -> Dict[str, Any]:
         price = _safe_float(market_snapshot.get("mark_price", 0.0))
