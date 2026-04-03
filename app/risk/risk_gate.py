@@ -39,13 +39,27 @@ class RiskGate:
             return RiskGateResult(True, decision.action.value, 0.0, "no_trade_or_hold")
 
         if self._stop_limit_breached(account_state):
-            if decision.action in {DecisionAction.REDUCE, DecisionAction.CLOSE}:
-                return RiskGateResult(True, decision.action.value, 0.0, "stop_limit_exit_allowed")
+            if self._is_exit_action(decision.action):
+                return RiskGateResult(
+                    True,
+                    decision.action.value,
+                    self._exit_size_multiplier(decision),
+                    "stop_limit_exit_allowed",
+                )
             return RiskGateResult(False, "NO_TRADE", 0.0, "daily_or_weekly_stop_reached")
 
-        open_positions = account_state.get("open_positions", [])
-        if isinstance(open_positions, list) and len(open_positions) >= self.settings.max_open_positions:
-            return RiskGateResult(False, "NO_TRADE", 0.0, "max_open_positions_reached")
+        if self._is_entry_action(decision.action):
+            open_positions = account_state.get("open_positions", [])
+            if isinstance(open_positions, list) and len(open_positions) >= self.settings.max_open_positions:
+                return RiskGateResult(False, "NO_TRADE", 0.0, "max_open_positions_reached")
+
+        if self._is_exit_action(decision.action):
+            return RiskGateResult(
+                True,
+                decision.action.value,
+                self._exit_size_multiplier(decision),
+                self._exit_reason(),
+            )
 
         base_capped_size = max(0.0, min(float(decision.size_multiplier), 1.0))
 
@@ -151,6 +165,27 @@ class RiskGate:
                     )
         except Exception:
             return
+
+    def _exit_reason(self) -> str:
+        if self.settings.dry_run:
+            return "dry_run_exit_allowed"
+        if self.settings.shadow_mode:
+            return "shadow_mode_exit_allowed"
+        return "live_exit_allowed"
+
+    @staticmethod
+    def _is_entry_action(action: DecisionAction) -> bool:
+        return action in {DecisionAction.ENTER_LONG, DecisionAction.ENTER_SHORT}
+
+    @staticmethod
+    def _is_exit_action(action: DecisionAction) -> bool:
+        return action in {DecisionAction.REDUCE, DecisionAction.CLOSE}
+
+    @staticmethod
+    def _exit_size_multiplier(decision: JudgeDecision) -> float:
+        if decision.action == DecisionAction.CLOSE:
+            return 1.0
+        return max(0.0, min(float(decision.size_multiplier), 1.0))
 
     @staticmethod
     def _drawdown_pct(baseline_equity: float, current_equity: float) -> float:
