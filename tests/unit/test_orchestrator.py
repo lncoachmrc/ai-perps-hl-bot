@@ -215,3 +215,81 @@ def test_orchestrator_builds_real_position_state_from_account_open_positions(mon
     assert position_state["pnl_usd"] == 2.5
     assert position_state["leverage"] == 2.0
     assert len(orchestrator.judge.calls) == 1
+
+
+class _ExitJudgeLLM:
+    def __init__(self, enabled, model):
+        self.enabled = enabled
+        self.model = model
+
+    def decide(self, dossier):
+        return JudgeDecision(
+            action=DecisionAction.CLOSE,
+            confidence=0.9,
+            size_multiplier=0.0,
+            ttl_minutes=5,
+            reasons=["close open position for refresh test"],
+        )
+
+
+def test_orchestrator_refreshes_account_state_after_accepted_execution(monkeypatch):
+    class _StubExchange:
+        def __init__(self, dry_run, shadow_mode):
+            self.dry_run = dry_run
+            self.shadow_mode = shadow_mode
+            self.account_state_calls = 0
+
+        def get_account_state(self):
+            self.account_state_calls += 1
+            if self.account_state_calls == 1:
+                return {
+                    "equity": 1000.0,
+                    "available_margin": 900.0,
+                    "open_positions": [
+                        {
+                            "asset": "ETH",
+                            "side": "short",
+                            "size": 0.25,
+                            "size_signed": -0.25,
+                            "entry_price": 2050.0,
+                            "mark_price": 2040.0,
+                            "pnl_usd": 2.5,
+                            "leverage": 2.0,
+                        }
+                    ],
+                }
+            return {
+                "equity": 1002.0,
+                "available_margin": 1002.0,
+                "open_positions": [],
+            }
+
+        def get_market_snapshot(self, asset):
+            return {
+                "asset": asset,
+                "mark_price": 2040.0,
+                "spread_bps": 0.5,
+                "funding_rate": 0.0,
+                "open_interest_delta_1h": 0.0,
+                "regime_hint": "balanced",
+            }
+
+        def place_order(self, payload):
+            assert payload["action"] == "CLOSE"
+            return {"accepted": True, "dry_run": False}
+
+    monkeypatch.setattr(orchestrator_module, "HyperliquidClient", _StubExchange)
+    monkeypatch.setattr(orchestrator_module, "QuantExpert", _StubQuantExpert)
+    monkeypatch.setattr(orchestrator_module, "ProphetExpert", _StubProphetExpert)
+    monkeypatch.setattr(orchestrator_module, "NewsExpert", _StubNewsExpert)
+    monkeypatch.setattr(orchestrator_module, "DecisionDossierBuilder", _CapturingBuilder)
+    monkeypatch.setattr(orchestrator_module, "JudgeLLM", _ExitJudgeLLM)
+    monkeypatch.setattr(orchestrator_module, "RiskGate", _StubRiskGate)
+    monkeypatch.setattr(orchestrator_module, "JournalService", _StubJournalService)
+
+    settings = _settings(universe_symbols=["ETH"], dry_run=False, shadow_mode=True)
+    orchestrator = orchestrator_module.Orchestrator(settings)
+
+    orchestrator.run_once()
+
+    assert orchestrator.exchange.account_state_calls == 2
