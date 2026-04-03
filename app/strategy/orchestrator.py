@@ -76,6 +76,31 @@ def _mode_label(settings: Settings) -> str:
     return "live"
 
 
+def _position_state_for_asset(open_positions: Any, asset: str) -> Dict[str, Any]:
+    flat_state: Dict[str, Any] = {"side": "flat", "asset": asset}
+    if not isinstance(open_positions, list):
+        return flat_state
+
+    asset_upper = str(asset).upper()
+    for position in open_positions:
+        if not isinstance(position, dict):
+            continue
+        if str(position.get("asset", "")).upper() != asset_upper:
+            continue
+        return {
+            "asset": asset_upper,
+            "side": str(position.get("side", "flat")),
+            "size": position.get("size", 0.0),
+            "size_signed": position.get("size_signed", 0.0),
+            "entry_price": position.get("entry_price", 0.0),
+            "mark_price": position.get("mark_price", 0.0),
+            "pnl_usd": position.get("pnl_usd", 0.0),
+            "leverage": position.get("leverage", 0.0),
+        }
+
+    return flat_state
+
+
 class Orchestrator:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -181,7 +206,7 @@ class Orchestrator:
                 quant_expert=quant_view,
                 prophet_expert=prophet_view,
                 news_expert=news_view,
-                position_state={"side": "flat", "asset": asset},
+                position_state=_position_state_for_asset(open_positions, asset),
                 execution_context={
                     "preferred_order_type": "IOC",
                     "slippage_estimate_bps": 2.0,
