@@ -142,7 +142,10 @@ def _mode_label(settings: Settings) -> str:
 class Orchestrator:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.exchange = HyperliquidClient(dry_run=settings.dry_run)
+        self.exchange = HyperliquidClient(
+            dry_run=settings.dry_run,
+            shadow_mode=settings.shadow_mode,
+        )
         self.quant = QuantExpert()
         self.prophet = ProphetExpert()
         self.news = NewsExpert()
