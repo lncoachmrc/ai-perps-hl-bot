@@ -453,6 +453,106 @@ class HyperliquidClient:
             return float(int(rounded))
         return float(f"{rounded:.{sz_decimals}f}")
 
+    def _find_open_position(self, asset: str) -> Dict[str, Any] | None:
+        account_state = self.get_account_state()
+        open_positions = account_state.get("open_positions", [])
+        if not isinstance(open_positions, list):
+            return None
+
+        asset = str(asset).upper()
+        for position in open_positions:
+            if not isinstance(position, dict):
+                continue
+            if str(position.get("asset", "")).upper() != asset:
+                continue
+
+            size = abs(_safe_float(position.get("size", position.get("size_signed", 0.0))))
+            if size <= 0:
+                continue
+
+            size_signed = _safe_float(position.get("size_signed", 0.0))
+            side = str(position.get("side", "flat")).lower()
+            if side not in {"long", "short"}:
+                if size_signed > 0:
+                    side = "long"
+                elif size_signed < 0:
+                    side = "short"
+                else:
+                    continue
+
+            return {
+                "asset": asset,
+                "side": side,
+                "size": size,
+                "size_signed": size_signed,
+                "entry_price": _safe_float(position.get("entry_price", 0.0)),
+                "mark_price": _safe_float(position.get("mark_price", 0.0)),
+                "pnl_usd": _safe_float(position.get("pnl_usd", 0.0)),
+                "leverage": _safe_float(position.get("leverage", 0.0)),
+            }
+        return None
+
+    def _build_exit_order_plan(
+        self,
+        *,
+        asset: str,
+        action: str,
+        size_multiplier: float,
+        mark_price: float,
+    ) -> Dict[str, Any]:
+        position = self._find_open_position(asset)
+        if position is None:
+            return {"ok": False, "error": f"missing_open_position:{asset}"}
+
+        position_size = _safe_float(position.get("size", 0.0))
+        if position_size <= 0:
+            return {"ok": False, "error": "non_positive_position_size"}
+
+        if action == "CLOSE":
+            exit_fraction = 1.0
+        else:
+            if size_multiplier <= 0:
+                return {"ok": False, "error": "non_positive_reduce_size_multiplier"}
+            exit_fraction = min(size_multiplier, 1.0)
+
+        raw_size = position_size * exit_fraction
+        rounded_size = self._round_size_down(asset, raw_size)
+        if rounded_size <= 0:
+            return {
+                "ok": False,
+                "error": "rounded_size_zero",
+                "asset": asset,
+                "mark_price": mark_price,
+                "requested_notional_usdc": raw_size * mark_price,
+            }
+
+        side = str(position.get("side", "flat")).lower()
+        if side == "long":
+            is_buy = False
+        elif side == "short":
+            is_buy = True
+        else:
+            return {"ok": False, "error": f"unsupported_position_side:{side}"}
+
+        return {
+            "ok": True,
+            "asset": asset,
+            "action": action,
+            "is_buy": is_buy,
+            "mark_price": mark_price,
+            "size_multiplier": size_multiplier,
+            "effective_size_multiplier": exit_fraction,
+            "requested_notional_usdc": raw_size * mark_price,
+            "order_notional_usdc": rounded_size * mark_price,
+            "raw_size": raw_size,
+            "rounded_size": rounded_size,
+            "sz_decimals": self._size_decimals(asset),
+            "slippage": self.live_order_slippage,
+            "is_exit": True,
+            "position_side": side,
+            "position_size": position_size,
+        }
+
     def _build_order_plan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         asset = str(payload.get("asset", "")).upper()
         action = str(payload.get("action", "")).upper()
@@ -460,13 +560,28 @@ class HyperliquidClient:
 
         if not asset:
             return {"ok": False, "error": "missing_asset"}
-        if action not in {"ENTER_LONG", "ENTER_SHORT"}:
+        if action not in {"ENTER_LONG", "ENTER_SHORT", "REDUCE", "CLOSE"}:
             return {"ok": False, "error": f"unsupported_action:{action}"}
 
         market = self.get_market_snapshot(asset)
         mark_price = _safe_float(market.get("mark_price", 0.0))
         if mark_price <= 0:
+            position = self._find_open_position(asset)
+            if position is not None:
+                mark_price = max(
+                    _safe_float(position.get("mark_price", 0.0)),
+                    _safe_float(position.get("entry_price", 0.0)),
+                )
+        if mark_price <= 0:
             return {"ok": False, "error": "missing_mark_price"}
+
+        if action in {"REDUCE", "CLOSE"}:
+            return self._build_exit_order_plan(
+                asset=asset,
+                action=action,
+                size_multiplier=size_multiplier,
+                mark_price=mark_price,
+            )
 
         effective_multiplier = min(size_multiplier, self.live_initial_size_multiplier_cap)
         desired_notional = self.base_equity_usdc * effective_multiplier
@@ -499,6 +614,7 @@ class HyperliquidClient:
             "rounded_size": rounded_size,
             "sz_decimals": self._size_decimals(asset),
             "slippage": self.live_order_slippage,
+            "is_exit": False,
         }
 
     def _extract_order_status(self, response: Dict[str, Any]) -> Tuple[str, str]:
