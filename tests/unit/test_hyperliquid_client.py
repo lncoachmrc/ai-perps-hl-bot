@@ -127,3 +127,49 @@ def test_place_order_reduce_rejects_when_open_position_is_missing():
     assert result["accepted"] is False
     assert result["sent_to_exchange"] is False
     assert result["error"] == "missing_open_position:BTC"
+
+
+def test_place_order_live_err_response_is_rejected():
+    client = _client(dry_run=False, shadow_mode=False)
+    client.get_market_snapshot = lambda asset: {"asset": asset, "mark_price": 2050.0}
+    client.get_account_state = lambda: {
+        "equity": 1000.0,
+        "available_margin": 800.0,
+        "open_positions": [],
+    }
+
+    class _StubExchange:
+        def market_open(self, asset, is_buy, size, slippage):
+            return {"status": "err", "response": {"data": {"statuses": [{"error": "exchange_rejected"}]}}}
+
+    client._exchange = _StubExchange()
+
+    result = client.place_order({"asset": "ETH", "action": "ENTER_SHORT", "size_multiplier": 0.1})
+
+    assert result["accepted"] is False
+    assert result["sent_to_exchange"] is True
+    assert result["order_status"] == "error"
+    assert result["error"] == "exchange_rejected"
+
+
+def test_place_order_live_unknown_response_is_rejected():
+    client = _client(dry_run=False, shadow_mode=False)
+    client.get_market_snapshot = lambda asset: {"asset": asset, "mark_price": 2050.0}
+    client.get_account_state = lambda: {
+        "equity": 1000.0,
+        "available_margin": 800.0,
+        "open_positions": [],
+    }
+
+    class _StubExchange:
+        def market_open(self, asset, is_buy, size, slippage):
+            return {"status": "unknown"}
+
+    client._exchange = _StubExchange()
+
+    result = client.place_order({"asset": "ETH", "action": "ENTER_SHORT", "size_multiplier": 0.1})
+
+    assert result["accepted"] is False
+    assert result["sent_to_exchange"] is True
+    assert result["order_status"] == "unknown"
+    assert result["error"] == "order_status:unknown"
