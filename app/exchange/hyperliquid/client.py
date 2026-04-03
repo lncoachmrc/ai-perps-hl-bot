@@ -620,7 +620,18 @@ class HyperliquidClient:
     def _extract_order_status(self, response: Dict[str, Any]) -> Tuple[str, str]:
         if not isinstance(response, dict):
             return "unknown", ""
-        status = str(response.get("status", "unknown"))
+        raw_status = str(response.get("status", "unknown")).strip().lower()
+        status_aliases = {
+            "ok": "ok",
+            "success": "ok",
+            "filled": "filled",
+            "resting": "resting",
+            "err": "error",
+            "error": "error",
+            "blocked": "blocked",
+            "unknown": "unknown",
+        }
+        status = status_aliases.get(raw_status, raw_status or "unknown")
         response_obj = response.get("response", {})
         data = response_obj.get("data", {}) if isinstance(response_obj, dict) else {}
         statuses = data.get("statuses", []) if isinstance(data, dict) else []
@@ -746,7 +757,11 @@ class HyperliquidClient:
                 slippage=plan["slippage"],
             )
             order_status, detail = self._extract_order_status(response if isinstance(response, dict) else {})
-            accepted = order_status not in {"error", "blocked", "unknown"} or bool(response)
+            accepted_statuses = {"filled", "resting", "ok"}
+            accepted = order_status in accepted_statuses
+            error_message = ""
+            if not accepted:
+                error_message = detail or f"order_status:{order_status}"
             logger.warning(
                 "🚨 Live order sent | asset=%s | action=%s | rounded_size=%s | notional_usdc=%s | order_status=%s | detail=%s",
                 plan["asset"],
@@ -764,7 +779,7 @@ class HyperliquidClient:
                 "simulated": False,
                 "sent_to_exchange": True,
                 "order_status": order_status,
-                "error": detail if order_status == "error" else "",
+                "error": error_message,
                 "plan": plan,
                 "response": response,
             }
