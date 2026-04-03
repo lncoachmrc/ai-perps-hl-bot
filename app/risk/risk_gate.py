@@ -1,7 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional, Tuple
+
+try:
+    import psycopg2
+    from psycopg2.extras import Json
+except Exception:  # pragma: no cover - optional DB dependency in tests/dev
+    psycopg2 = None  # type: ignore[assignment]
+    Json = None  # type: ignore[assignment]
 
 from app.core.enums import DecisionAction
 from app.domain.decision import JudgeDecision
@@ -17,12 +25,23 @@ class RiskGateResult:
 
 
 class RiskGate:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        now_fn: Optional[Callable[[], datetime]] = None,
+    ) -> None:
         self.settings = settings
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self._baseline_cache: Dict[Tuple[str, str], float] = {}
 
     def evaluate(self, asset: str, decision: JudgeDecision, account_state: Dict[str, object]) -> RiskGateResult:
         if decision.action in {DecisionAction.NO_TRADE, DecisionAction.HOLD}:
             return RiskGateResult(True, decision.action.value, 0.0, "no_trade_or_hold")
+
+        if self._stop_limit_breached(account_state):
+            if decision.action in {DecisionAction.REDUCE, DecisionAction.CLOSE}:
+                return RiskGateResult(True, decision.action.value, 0.0, "stop_limit_exit_allowed")
+            return RiskGateResult(False, "NO_TRADE", 0.0, "daily_or_weekly_stop_reached")
 
         open_positions = account_state.get("open_positions", [])
         if isinstance(open_positions, list) and len(open_positions) >= self.settings.max_open_positions:
@@ -40,3 +59,115 @@ class RiskGate:
             return RiskGateResult(True, decision.action.value, live_capped_size, "shadow_mode_allowed")
 
         return RiskGateResult(True, decision.action.value, live_capped_size, "live_allowed")
+
+    def _stop_limit_breached(self, account_state: Dict[str, object]) -> bool:
+        equity = self._safe_float(account_state.get("equity"))
+        if equity <= 0.0:
+            return False
+
+        now_utc = self._normalize_now(self._now_fn())
+        day_key = now_utc.strftime("%Y-%m-%d")
+        iso_year, iso_week, _ = now_utc.isocalendar()
+        week_key = f"{iso_year}-W{iso_week:02d}"
+
+        daily_baseline = self._get_or_create_baseline("day", day_key, equity, now_utc)
+        if self._drawdown_pct(daily_baseline, equity) >= max(0.0, float(self.settings.daily_stop_pct)):
+            return True
+
+        weekly_baseline = self._get_or_create_baseline("week", week_key, equity, now_utc)
+        if self._drawdown_pct(weekly_baseline, equity) >= max(0.0, float(self.settings.weekly_stop_pct)):
+            return True
+
+        return False
+
+    def _get_or_create_baseline(
+        self,
+        scope: str,
+        period_key: str,
+        current_equity: float,
+        now_utc: datetime,
+    ) -> float:
+        cache_key = (scope, period_key)
+        cached = self._baseline_cache.get(cache_key)
+        if cached is not None and cached > 0.0:
+            return cached
+
+        baseline = self._load_baseline_from_db(scope, period_key)
+        if baseline is None or baseline <= 0.0:
+            baseline = current_equity
+            self._persist_baseline_to_db(scope, period_key, baseline, now_utc)
+
+        self._baseline_cache[cache_key] = baseline
+        return baseline
+
+    def _load_baseline_from_db(self, scope: str, period_key: str) -> Optional[float]:
+        if not self.settings.database_url or psycopg2 is None:
+            return None
+
+        try:
+            with psycopg2.connect(self.settings.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT payload->>'baseline_equity'
+                        FROM journal_events
+                        WHERE event_type = 'risk_baseline'
+                          AND COALESCE(payload->>'scope', '') = %s
+                          AND COALESCE(payload->>'period_key', '') = %s
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (scope, period_key),
+                    )
+                    row = cur.fetchone()
+        except Exception:
+            return None
+
+        if not row:
+            return None
+
+        return self._safe_float(row[0])
+
+    def _persist_baseline_to_db(self, scope: str, period_key: str, baseline_equity: float, now_utc: datetime) -> None:
+        if not self.settings.database_url or psycopg2 is None or Json is None:
+            return
+
+        payload = {
+            "scope": scope,
+            "period_key": period_key,
+            "baseline_equity": baseline_equity,
+            "created_at_utc": now_utc.isoformat(),
+        }
+
+        try:
+            with psycopg2.connect(self.settings.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO journal_events (event_type, asset, payload)
+                        VALUES (%s, %s, %s)
+                        """,
+                        ("risk_baseline", None, Json(payload)),
+                    )
+        except Exception:
+            return
+
+    @staticmethod
+    def _drawdown_pct(baseline_equity: float, current_equity: float) -> float:
+        if baseline_equity <= 0.0:
+            return 0.0
+        loss = max(0.0, baseline_equity - current_equity)
+        return (loss / baseline_equity) * 100.0
+
+    @staticmethod
+    def _normalize_now(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
