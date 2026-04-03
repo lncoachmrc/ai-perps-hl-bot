@@ -139,6 +139,60 @@ def _mode_label(settings: Settings) -> str:
     return "live"
 
 
+def _build_position_state(*, asset: str, account_state: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_asset = str(asset).upper()
+    flat_state = {
+        "asset": normalized_asset,
+        "side": "flat",
+        "size": 0.0,
+        "size_signed": 0.0,
+        "entry_price": 0.0,
+        "mark_price": 0.0,
+        "pnl_usd": 0.0,
+        "leverage": 0.0,
+    }
+
+    open_positions = account_state.get("open_positions", [])
+    if not isinstance(open_positions, list):
+        return flat_state
+
+    for position in open_positions:
+        if not isinstance(position, dict):
+            continue
+
+        position_asset = str(position.get("asset", "")).upper()
+        if position_asset != normalized_asset:
+            continue
+
+        size_signed = _safe_float(position.get("size_signed"))
+        size = _safe_float(position.get("size"))
+        side = str(position.get("side", "")).lower()
+
+        if side not in {"long", "short"}:
+            if size_signed > 0:
+                side = "long"
+            elif size_signed < 0:
+                side = "short"
+            else:
+                side = "flat"
+
+        if size <= 0.0 and size_signed != 0.0:
+            size = abs(size_signed)
+
+        return {
+            "asset": normalized_asset,
+            "side": side,
+            "size": size,
+            "size_signed": size_signed,
+            "entry_price": _safe_float(position.get("entry_price")),
+            "mark_price": _safe_float(position.get("mark_price")),
+            "pnl_usd": _safe_float(position.get("pnl_usd")),
+            "leverage": _safe_float(position.get("leverage")),
+        }
+
+    return flat_state
+
+
 class Orchestrator:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -241,13 +295,15 @@ class Orchestrator:
                 news_view.get("freshness_minutes", "n/a"),
             )
 
+            position_state = _build_position_state(asset=asset, account_state=account_state)
+
             dossier = self.builder.build(
                 asset=asset,
                 market_state=market,
                 quant_expert=quant_view,
                 prophet_expert=prophet_view,
                 news_expert=news_view,
-                position_state={"side": "flat", "asset": asset},
+                position_state=position_state,
                 execution_context={
                     "preferred_order_type": "IOC",
                     "slippage_estimate_bps": 2.0,
