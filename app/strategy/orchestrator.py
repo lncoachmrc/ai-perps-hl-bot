@@ -383,6 +383,21 @@ class Orchestrator:
                     execution_result.get("accepted", False),
                     execution_result.get("dry_run", self.settings.dry_run),
                 )
+                if execution_result.get("accepted", False):
+                    account_state = self.exchange.get_account_state()
+                    refreshed_open_positions = account_state.get("open_positions", [])
+                    refreshed_count = (
+                        len(refreshed_open_positions)
+                        if isinstance(refreshed_open_positions, list)
+                        else 0
+                    )
+                    logger.info(
+                        "🔄 %s | Account snapshot refreshed after execution | equity=%s | available_margin=%s | open_positions=%s",
+                        asset,
+                        _fmt_num(account_state.get("equity")),
+                        _fmt_num(account_state.get("available_margin")),
+                        refreshed_count,
+                    )
             else:
                 logger.info(
                     "⏭️ %s | No order sent | allowed=%s | final_action=%s | reason=%s",
