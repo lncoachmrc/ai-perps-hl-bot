@@ -377,13 +377,27 @@ class Orchestrator:
                         "dry_run": self.settings.dry_run,
                     }
                 )
-                logger.info(
-                    "✅ %s | Execution result | accepted=%s | dry_run=%s",
-                    asset,
-                    execution_result.get("accepted", False),
-                    execution_result.get("dry_run", self.settings.dry_run),
-                )
-                if execution_result.get("accepted", False):
+                execution_accepted = bool(execution_result.get("accepted", False))
+                execution_order_status = str(execution_result.get("order_status", "unknown"))
+                execution_error = str(execution_result.get("error", "") or "")
+                if execution_accepted:
+                    logger.info(
+                        "✅ %s | Execution result | accepted=%s | dry_run=%s | order_status=%s",
+                        asset,
+                        execution_accepted,
+                        execution_result.get("dry_run", self.settings.dry_run),
+                        execution_order_status,
+                    )
+                else:
+                    logger.error(
+                        "❌ %s | Execution result | accepted=%s | dry_run=%s | order_status=%s | error=%s",
+                        asset,
+                        execution_accepted,
+                        execution_result.get("dry_run", self.settings.dry_run),
+                        execution_order_status,
+                        execution_error or "n/a",
+                    )
+                if execution_accepted:
                     account_state = self.exchange.get_account_state()
                     refreshed_open_positions = account_state.get("open_positions", [])
                     refreshed_count = (
