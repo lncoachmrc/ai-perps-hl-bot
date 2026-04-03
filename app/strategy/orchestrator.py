@@ -19,6 +19,69 @@ from app.settings import Settings
 logger = logging.getLogger(__name__)
 
 
+MIN_SETUP_SCORE_FOR_JUDGE = 0.40
+MIN_SIGNAL_STRENGTH_FOR_JUDGE = 0.20
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_prefilter_no_trade_decision(*, asset: str, quant_view: Dict[str, Any]) -> "JudgeDecision":
+    from app.core.enums import DecisionAction
+    from app.domain.decision import JudgeDecision
+
+    setup_score = _safe_float(quant_view.get("setup_score"))
+    signal_strength = _safe_float(quant_view.get("signal_strength"))
+
+    return JudgeDecision(
+        action=DecisionAction.NO_TRADE,
+        confidence=0.95,
+        size_multiplier=0.0,
+        ttl_minutes=20,
+        reasons=[
+            (
+                f"Pre-judge deterministic filter blocked {asset}: "
+                f"setup_score {setup_score:.4f} < {MIN_SETUP_SCORE_FOR_JUDGE:.2f}."
+            )
+            if setup_score < MIN_SETUP_SCORE_FOR_JUDGE
+            else (
+                f"Pre-judge deterministic filter passed setup_score {setup_score:.4f}, "
+                f"but signal_strength {signal_strength:.4f} < {MIN_SIGNAL_STRENGTH_FOR_JUDGE:.2f}."
+            ),
+            "Judge LLM was skipped because the quant floor was not met.",
+            "This filter applies before final judgment to remove repetitive threshold work from the prompt.",
+        ],
+        stop_logic=(
+            "No position entered; deterministic pre-judge quant filter requires "
+            f"setup_score >= {MIN_SETUP_SCORE_FOR_JUDGE:.2f} and "
+            f"signal_strength >= {MIN_SIGNAL_STRENGTH_FOR_JUDGE:.2f} before judge evaluation."
+        ),
+        take_profit_logic=(
+            "No position entered; take-profit planning is skipped until the deterministic "
+            "pre-judge quant filter is satisfied."
+        ),
+    )
+
+
+def _passes_pre_judge_quant_filter(*, dossier: Dict[str, Any]) -> bool:
+    position_side = str(dossier.get("position_state", {}).get("side", "flat")).lower()
+    if position_side not in {"flat", "", "none"}:
+        return True
+
+    quant_view = dossier.get("quant_expert", {})
+    setup_score = _safe_float(quant_view.get("setup_score"))
+    signal_strength = _safe_float(quant_view.get("signal_strength"))
+
+    return (
+        setup_score >= MIN_SETUP_SCORE_FOR_JUDGE
+        and signal_strength >= MIN_SIGNAL_STRENGTH_FOR_JUDGE
+    )
+
+
 def _jsonable(value: Any) -> Any:
     if is_dataclass(value):
         return _jsonable(asdict(value))
@@ -76,35 +139,10 @@ def _mode_label(settings: Settings) -> str:
     return "live"
 
 
-def _position_state_for_asset(open_positions: Any, asset: str) -> Dict[str, Any]:
-    flat_state: Dict[str, Any] = {"side": "flat", "asset": asset}
-    if not isinstance(open_positions, list):
-        return flat_state
-
-    asset_upper = str(asset).upper()
-    for position in open_positions:
-        if not isinstance(position, dict):
-            continue
-        if str(position.get("asset", "")).upper() != asset_upper:
-            continue
-        return {
-            "asset": asset_upper,
-            "side": str(position.get("side", "flat")),
-            "size": position.get("size", 0.0),
-            "size_signed": position.get("size_signed", 0.0),
-            "entry_price": position.get("entry_price", 0.0),
-            "mark_price": position.get("mark_price", 0.0),
-            "pnl_usd": position.get("pnl_usd", 0.0),
-            "leverage": position.get("leverage", 0.0),
-        }
-
-    return flat_state
-
-
 class Orchestrator:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.exchange = HyperliquidClient(dry_run=settings.dry_run, shadow_mode=settings.shadow_mode)
+        self.exchange = HyperliquidClient(dry_run=settings.dry_run)
         self.quant = QuantExpert()
         self.prophet = ProphetExpert()
         self.news = NewsExpert()
@@ -206,7 +244,7 @@ class Orchestrator:
                 quant_expert=quant_view,
                 prophet_expert=prophet_view,
                 news_expert=news_view,
-                position_state=_position_state_for_asset(open_positions, asset),
+                position_state={"side": "flat", "asset": asset},
                 execution_context={
                     "preferred_order_type": "IOC",
                     "slippage_estimate_bps": 2.0,
@@ -224,7 +262,21 @@ class Orchestrator:
                 _fmt_num(dossier.execution_context.get("fee_estimate_bps")),
             )
 
-            decision = self.judge.decide(dossier.to_dict())
+            dossier_dict = dossier.to_dict()
+            if _passes_pre_judge_quant_filter(dossier=dossier_dict):
+                decision = self.judge.decide(dossier_dict)
+            else:
+                decision = _build_prefilter_no_trade_decision(asset=asset, quant_view=quant_view)
+                logger.info(
+                    "🚫 %s | Pre-judge quant filter blocked judge call | min_setup_score=%s | "
+                    "min_signal_strength=%s | setup_score=%s | signal_strength=%s",
+                    asset,
+                    _fmt_num(MIN_SETUP_SCORE_FOR_JUDGE),
+                    _fmt_num(MIN_SIGNAL_STRENGTH_FOR_JUDGE),
+                    _fmt_num(quant_view.get("setup_score")),
+                    _fmt_num(quant_view.get("signal_strength")),
+                )
+
             decision_action = _decision_value(decision.action)
             logger.info(
                 "%s %s | Judge decision | action=%s | confidence=%s | size_multiplier=%s | "
@@ -264,18 +316,13 @@ class Orchestrator:
                         "action": gate.final_action,
                         "size_multiplier": gate.final_size_multiplier,
                         "dry_run": self.settings.dry_run,
-                        "shadow_mode": self.settings.shadow_mode,
                     }
                 )
                 logger.info(
-                    "✅ %s | Execution result | accepted=%s | mode=%s | simulated=%s | sent_to_exchange=%s | order_status=%s | error=%s",
+                    "✅ %s | Execution result | accepted=%s | dry_run=%s",
                     asset,
                     execution_result.get("accepted", False),
-                    execution_result.get("mode", _mode_label(self.settings)),
-                    execution_result.get("simulated", self.settings.dry_run or self.settings.shadow_mode),
-                    execution_result.get("sent_to_exchange", False),
-                    execution_result.get("order_status", "unknown"),
-                    execution_result.get("error", ""),
+                    execution_result.get("dry_run", self.settings.dry_run),
                 )
             else:
                 logger.info(
