@@ -11,7 +11,6 @@ import psycopg2
 from psycopg2.extras import Json
 
 from app.experts.news.sources.alternative_me import AlternativeMeSource
-from app.experts.news.sources.coinjournal import CoinJournalSource
 from app.experts.news.sources.coinmarketcap import CoinMarketCapSource
 from app.experts.news.sources.cryptopanic import CryptoPanicSource
 from app.settings import Settings
@@ -68,7 +67,6 @@ class NewsExpert:
         self.cryptopanic = CryptoPanicSource(self.settings)
         self.coinmarketcap = CoinMarketCapSource(self.settings)
         self.alternative_me = AlternativeMeSource(self.settings)
-        self.coinjournal = CoinJournalSource(self.settings)
 
         self._aggregate_cache: Dict[str, Any] = {"fetched_at": 0.0, "items": []}
         self._seen_path = Path(self.settings.news_events_cache_path)
@@ -168,7 +166,6 @@ class NewsExpert:
         items.extend(self.cryptopanic.fetch())
         items.extend(self.coinmarketcap.fetch())
         items.extend(self.alternative_me.fetch())
-        items.extend(self.coinjournal.fetch())
 
         deduped = self._dedupe_items(items)
         self._write_news_events(deduped)
