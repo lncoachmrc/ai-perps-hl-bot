@@ -22,6 +22,14 @@ def _settings(**overrides) -> Settings:
     return settings
 
 
+def _stop_hit_gate() -> RiskGate:
+    settings = _settings(daily_stop_pct=1.0, weekly_stop_pct=3.0, database_url="")
+    gate = RiskGate(settings, now_fn=lambda: datetime(2026, 4, 3, 12, 0, tzinfo=timezone.utc))
+    gate._baseline_cache[("day", "2026-04-03")] = 1000.0
+    gate._baseline_cache[("week", "2026-W14")] = 1000.0
+    return gate
+
+
 def test_risk_gate_allows_no_trade():
     gate = RiskGate(_settings())
     result = gate.evaluate(
@@ -34,10 +42,7 @@ def test_risk_gate_allows_no_trade():
 
 
 def test_risk_gate_blocks_entry_when_daily_stop_is_hit():
-    settings = _settings(daily_stop_pct=1.0, weekly_stop_pct=3.0, database_url="")
-    gate = RiskGate(settings, now_fn=lambda: datetime(2026, 4, 3, 12, 0, tzinfo=timezone.utc))
-    gate._baseline_cache[("day", "2026-04-03")] = 1000.0
-    gate._baseline_cache[("week", "2026-W14")] = 1000.0
+    gate = _stop_hit_gate()
 
     result = gate.evaluate(
         "BTC",
@@ -67,11 +72,52 @@ def test_risk_gate_blocks_entry_when_weekly_stop_is_hit():
     assert result.reason == "daily_or_weekly_stop_reached"
 
 
+def test_risk_gate_forces_close_when_hold_meets_stop_limit_with_open_position():
+    gate = _stop_hit_gate()
+
+    result = gate.evaluate(
+        "BTC",
+        _decision(DecisionAction.HOLD, size_multiplier=0.0),
+        {"equity": 989.0, "open_positions": [{"asset": "BTC", "side": "long", "size": 0.3, "size_signed": 0.3}]},
+    )
+
+    assert result.allowed is True
+    assert result.final_action == "CLOSE"
+    assert result.final_size_multiplier == 1.0
+    assert result.reason == "stop_limit_forced_close"
+
+
+def test_risk_gate_forces_close_when_no_trade_meets_stop_limit_with_open_position():
+    gate = _stop_hit_gate()
+
+    result = gate.evaluate(
+        "BTC",
+        _decision(DecisionAction.NO_TRADE, size_multiplier=0.0),
+        {"equity": 989.0, "open_positions": [{"asset": "BTC", "side": "short", "size": 0.2, "size_signed": -0.2}]},
+    )
+
+    assert result.allowed is True
+    assert result.final_action == "CLOSE"
+    assert result.final_size_multiplier == 1.0
+    assert result.reason == "stop_limit_forced_close"
+
+
+def test_risk_gate_does_not_force_close_for_other_assets():
+    gate = _stop_hit_gate()
+
+    result = gate.evaluate(
+        "BTC",
+        _decision(DecisionAction.HOLD, size_multiplier=0.0),
+        {"equity": 989.0, "open_positions": [{"asset": "ETH", "side": "long", "size": 0.3, "size_signed": 0.3}]},
+    )
+
+    assert result.allowed is False
+    assert result.final_action == "NO_TRADE"
+    assert result.reason == "daily_or_weekly_stop_reached"
+
+
 def test_risk_gate_allows_close_even_when_stop_is_hit():
-    settings = _settings(daily_stop_pct=1.0, weekly_stop_pct=3.0, database_url="")
-    gate = RiskGate(settings, now_fn=lambda: datetime(2026, 4, 3, 12, 0, tzinfo=timezone.utc))
-    gate._baseline_cache[("day", "2026-04-03")] = 1000.0
-    gate._baseline_cache[("week", "2026-W14")] = 1000.0
+    gate = _stop_hit_gate()
 
     result = gate.evaluate(
         "BTC",
@@ -86,10 +132,7 @@ def test_risk_gate_allows_close_even_when_stop_is_hit():
 
 
 def test_risk_gate_allows_reduce_even_when_stop_is_hit():
-    settings = _settings(daily_stop_pct=1.0, weekly_stop_pct=3.0, database_url="")
-    gate = RiskGate(settings, now_fn=lambda: datetime(2026, 4, 3, 12, 0, tzinfo=timezone.utc))
-    gate._baseline_cache[("day", "2026-04-03")] = 1000.0
-    gate._baseline_cache[("week", "2026-W14")] = 1000.0
+    gate = _stop_hit_gate()
 
     result = gate.evaluate(
         "BTC",
