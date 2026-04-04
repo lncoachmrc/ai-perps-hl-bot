@@ -14,6 +14,8 @@ from app.exchange.hyperliquid.client import HyperliquidClient
 from app.llm.judge import JudgeLLM
 from app.risk.risk_gate import RiskGate
 from app.services.journal_service import JournalService
+from app.services.market_observer_service import MarketObserverService
+from app.services.outcome_evaluator_service import OutcomeEvaluatorService
 from app.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -207,6 +209,8 @@ class Orchestrator:
         self.judge = JudgeLLM(enabled=bool(settings.openai_api_key), model=settings.openai_model)
         self.risk_gate = RiskGate(settings)
         self.journal = JournalService()
+        self.market_observer = MarketObserverService()
+        self.outcome_evaluator = OutcomeEvaluatorService()
         self._last_status = {"status": "booting", "loop_count": 0}
 
     def status(self) -> Dict[str, object]:
@@ -243,6 +247,13 @@ class Orchestrator:
             _fmt_num(account_state.get("available_margin")),
             open_positions_count,
         )
+
+        try:
+            created_outcomes = self.outcome_evaluator.evaluate_due_outcomes()
+            if created_outcomes:
+                logger.info("📚 Outcome evaluator | created_outcomes=%s", created_outcomes)
+        except Exception:
+            logger.exception("❌ Outcome evaluator failed during decision loop bootstrap")
 
         for asset in self.settings.universe_symbols:
             logger.info("🪙 %s | Starting asset review", asset)
@@ -361,6 +372,7 @@ class Orchestrator:
                 gate.reason,
             )
 
+            execution_result = None
             if gate.allowed and gate.final_action not in {"NO_TRADE", "HOLD"}:
                 logger.info(
                     "📤 %s | Sending order to execution layer | action=%s | size_multiplier=%s | mode=%s",
@@ -421,14 +433,29 @@ class Orchestrator:
                     gate.reason,
                 )
 
-            self.journal.append(
-                {
-                    "asset": asset,
-                    "dossier": dossier.to_dict(),
-                    "decision": _jsonable(decision),
-                    "risk_gate": _jsonable(gate),
-                }
-            )
+            journal_payload = {
+                "asset": asset,
+                "dossier": dossier.to_dict(),
+                "decision": _jsonable(decision),
+                "risk_gate": _jsonable(gate),
+            }
+            self.journal.append(journal_payload)
+
+            try:
+                observation_id = self.market_observer.record(
+                    asset=asset,
+                    market=market,
+                    dossier=dossier.to_dict(),
+                    decision=_jsonable(decision),
+                    risk_gate=_jsonable(gate),
+                    execution_result=execution_result if isinstance(execution_result, dict) else None,
+                    loop_count=next_loop,
+                )
+                if observation_id is not None:
+                    logger.info("🧪 %s | Market observation stored | observation_id=%s", asset, observation_id)
+            except Exception:
+                logger.exception("❌ %s | Market observer failed", asset)
+
             logger.info("📝 %s | Journal entry written", asset)
 
         self._last_status["loop_count"] = next_loop
