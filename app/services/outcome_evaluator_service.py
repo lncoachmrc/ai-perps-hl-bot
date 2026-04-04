@@ -190,10 +190,10 @@ class OutcomeEvaluatorService:
                 mo.risk_gate_final_action,
                 mo.cost_estimate_bps
             FROM market_observations mo
-            LEFT JOIN decision_outcomes do
-              ON do.observation_id = mo.id
-             AND do.horizon_minutes = %s
-            WHERE do.id IS NULL
+            LEFT JOIN decision_outcomes dout
+              ON dout.observation_id = mo.id
+             AND dout.horizon_minutes = %s
+            WHERE dout.id IS NULL
               AND mo.observed_at <= NOW() - (%s * INTERVAL '1 minute')
             ORDER BY mo.observed_at ASC
             LIMIT %s
