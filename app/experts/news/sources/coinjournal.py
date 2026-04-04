@@ -86,6 +86,57 @@ def _impact_from_title(title: str) -> str:
     return "low"
 
 
+def _timestamp_to_dt(value: Any) -> Optional[datetime]:
+    try:
+        ts = float(value or 0.0)
+    except Exception:
+        return None
+    if ts <= 0:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def _sanitize_cached_items(
+    items: Any,
+    *,
+    max_age_minutes: int,
+    fetched_at: Any,
+) -> List[Dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+
+    cache_fetched_at = _timestamp_to_dt(fetched_at)
+    sanitized: List[Dict[str, Any]] = []
+
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+
+        item = dict(raw_item)
+        published_at = _parse_dt(item.get("published_at"))
+
+        payload = item.get("payload")
+        if published_at is None and isinstance(payload, dict):
+            published_at = _parse_dt(payload.get("pubDate"))
+
+        reference_dt = published_at or cache_fetched_at
+        freshness = _freshness_minutes(reference_dt)
+
+        if freshness is not None and freshness > max_age_minutes:
+            continue
+
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+
+        item["title"] = title
+        item["published_at"] = published_at.isoformat() if published_at else None
+        item["freshness_minutes"] = freshness
+        sanitized.append(item)
+
+    return sanitized
+
+
 class CoinJournalSource:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -93,15 +144,24 @@ class CoinJournalSource:
 
     def fetch(self) -> List[Dict[str, Any]]:
         cached_payload = _safe_load_json(self.cache_path)
-        cached_items = cached_payload.get("items") if isinstance(cached_payload.get("items"), list) else None
+        raw_cached_items = cached_payload.get("items") if isinstance(cached_payload.get("items"), list) else None
         fetched_at = float(cached_payload.get("fetched_at", 0.0) or 0.0)
         age_seconds = max(0.0, datetime.now(timezone.utc).timestamp() - fetched_at)
 
-        if cached_items is not None and age_seconds < self.settings.coinjournal_min_interval_seconds:
+        cached_items = _sanitize_cached_items(
+            raw_cached_items,
+            max_age_minutes=self.settings.coinjournal_max_age_minutes,
+            fetched_at=fetched_at,
+        )
+
+        if raw_cached_items is not None and age_seconds < self.settings.coinjournal_min_interval_seconds:
             return cached_items
 
         try:
-            response = requests.get(self.settings.coinjournal_rss_url, timeout=self.settings.coinjournal_timeout_seconds)
+            response = requests.get(
+                self.settings.coinjournal_rss_url,
+                timeout=self.settings.coinjournal_timeout_seconds,
+            )
             response.raise_for_status()
             root = ET.fromstring(response.content)
 
@@ -140,9 +200,40 @@ class CoinJournalSource:
 
             _safe_write_json(
                 self.cache_path,
-                {"fetched_at": datetime.now(timezone.utc).timestamp(), "items": items},
+                {
+                    "fetched_at": datetime.now(timezone.utc).timestamp(),
+                    "items": items,
+                },
             )
             return items
+
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            logger.warning(
+                "📰 CoinJournal RSS fetch failed | status=%s | cache_items=%d | using fresh cache if available",
+                status_code,
+                len(cached_items),
+            )
+            return cached_items
+
+        except requests.RequestException as exc:
+            logger.warning(
+                "📰 CoinJournal RSS fetch failed | error=%s | cache_items=%d | using fresh cache if available",
+                exc.__class__.__name__,
+                len(cached_items),
+            )
+            return cached_items
+
+        except ET.ParseError:
+            logger.warning(
+                "📰 CoinJournal RSS parse failed | cache_items=%d | using fresh cache if available",
+                len(cached_items),
+            )
+            return cached_items
+
         except Exception:
-            logger.exception("📰 CoinJournal RSS fetch failed | using cache if available")
-            return cached_items or []
+            logger.exception(
+                "📰 CoinJournal unexpected failure | cache_items=%d | using fresh cache if available",
+                len(cached_items),
+            )
+            return cached_items
