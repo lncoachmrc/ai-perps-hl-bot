@@ -35,10 +35,11 @@ class RiskGate:
         self._baseline_cache: Dict[Tuple[str, str], float] = {}
 
     def evaluate(self, asset: str, decision: JudgeDecision, account_state: Dict[str, object]) -> RiskGateResult:
-        if decision.action in {DecisionAction.NO_TRADE, DecisionAction.HOLD}:
-            return RiskGateResult(True, decision.action.value, 0.0, "no_trade_or_hold")
+        asset_upper = str(asset).upper()
+        has_open_position = self._has_open_position(asset_upper, account_state)
+        stop_limit_breached = self._stop_limit_breached(account_state)
 
-        if self._stop_limit_breached(account_state):
+        if stop_limit_breached:
             if self._is_exit_action(decision.action):
                 return RiskGateResult(
                     True,
@@ -46,7 +47,19 @@ class RiskGate:
                     self._exit_size_multiplier(decision),
                     "stop_limit_exit_allowed",
                 )
+
+            if has_open_position and decision.action in {DecisionAction.NO_TRADE, DecisionAction.HOLD}:
+                return RiskGateResult(
+                    True,
+                    DecisionAction.CLOSE.value,
+                    1.0,
+                    "stop_limit_forced_close",
+                )
+
             return RiskGateResult(False, "NO_TRADE", 0.0, "daily_or_weekly_stop_reached")
+
+        if decision.action in {DecisionAction.NO_TRADE, DecisionAction.HOLD}:
+            return RiskGateResult(True, decision.action.value, 0.0, "no_trade_or_hold")
 
         if self._is_entry_action(decision.action):
             open_positions = account_state.get("open_positions", [])
@@ -206,3 +219,24 @@ class RiskGate:
             return float(value)
         except (TypeError, ValueError):
             return float(default)
+
+    def _has_open_position(self, asset: str, account_state: Dict[str, object]) -> bool:
+        open_positions = account_state.get("open_positions", [])
+        if not isinstance(open_positions, list):
+            return False
+
+        for position in open_positions:
+            if not isinstance(position, dict):
+                continue
+
+            position_asset = str(position.get("asset", "")).upper()
+            if position_asset != asset:
+                continue
+
+            size = self._safe_float(position.get("size"))
+            size_signed = self._safe_float(position.get("size_signed"))
+
+            if size > 0.0 or size_signed != 0.0:
+                return True
+
+        return False
