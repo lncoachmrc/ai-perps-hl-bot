@@ -42,6 +42,18 @@ def _clean_env(value: str | None) -> str:
     return value.strip().strip('"').strip("'")
 
 
+def _normalize_address(value: str | None) -> str:
+    cleaned = _clean_env(value)
+    return cleaned.lower() if cleaned else ""
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _mask_address(value: str) -> str:
     if len(value) <= 12:
         return value
@@ -102,14 +114,17 @@ class HyperliquidClient:
         self.dry_run = dry_run
         self.shadow_mode = shadow_mode
 
-        self.account_address = _clean_env(os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS"))
-        self.vault_address = _clean_env(os.getenv("HYPERLIQUID_VAULT_ADDRESS"))
+        self.account_address = _normalize_address(os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS"))
+        self.vault_address = _normalize_address(os.getenv("HYPERLIQUID_VAULT_ADDRESS"))
         self.private_key = _clean_env(os.getenv("HYPERLIQUID_PRIVATE_KEY"))
+        self.signer_address = ""
+        self.allow_different_signer = _env_flag("ALLOW_DIFFERENT_SIGNER", False)
+        self.block_on_signer_mismatch = _env_flag("DEPLOY_FAILSAFE_BLOCK_ON_SIGNER_MISMATCH", False)
 
         if (
             self.account_address
             and self.vault_address
-            and self.account_address.lower() == self.vault_address.lower()
+            and self.account_address == self.vault_address
         ):
             logger.warning(
                 "⚠️ HYPERLIQUID_VAULT_ADDRESS equals HYPERLIQUID_ACCOUNT_ADDRESS | treating vault address as unset for direct account trading"
@@ -186,6 +201,37 @@ class HyperliquidClient:
 
         try:
             wallet = Account.from_key(self.private_key)
+            self.signer_address = _normalize_address(getattr(wallet, "address", ""))
+            using_vault = bool(self.vault_address)
+            signer_matches_account = bool(self.signer_address) and self.signer_address == self.account_address
+            signer_matches_vault = bool(self.signer_address and self.vault_address) and self.signer_address == self.vault_address
+
+            logger.info(
+                "🔐 Hyperliquid signer check | signer=%s | account=%s | vault=%s | using_vault=%s | signer_matches_account=%s | signer_matches_vault=%s | allow_different_signer=%s | block_on_signer_mismatch=%s",
+                _mask_address(self.signer_address) if self.signer_address else "missing",
+                _mask_address(self.account_address),
+                _mask_address(self.vault_address) if self.vault_address else "none",
+                "yes" if using_vault else "no",
+                "yes" if signer_matches_account else "no",
+                "yes" if signer_matches_vault else "no",
+                "yes" if self.allow_different_signer else "no",
+                "yes" if self.block_on_signer_mismatch else "no",
+            )
+
+            direct_account_signer_mismatch = (not using_vault) and (not signer_matches_account)
+            if direct_account_signer_mismatch:
+                logger.warning(
+                    "⚠️ Hyperliquid direct-account signer mismatch detected | signer=%s | account=%s | vault=none",
+                    _mask_address(self.signer_address) if self.signer_address else "missing",
+                    _mask_address(self.account_address),
+                )
+                if self.block_on_signer_mismatch and not self.allow_different_signer:
+                    logger.error(
+                        "❌ Live execution blocked | signer/account mismatch on direct account mode and DEPLOY_FAILSAFE_BLOCK_ON_SIGNER_MISMATCH=true"
+                    )
+                    self._exchange = None
+                    return
+
             self._exchange = Exchange(
                 wallet,
                 constants.MAINNET_API_URL,
@@ -194,10 +240,12 @@ class HyperliquidClient:
                 timeout=self.execution_timeout_seconds,
             )
             logger.warning(
-                "🚨 Hyperliquid execution mode | mode=live | real_orders_enabled=yes | account=%s | vault=%s | "
-                "live_size_cap=%s | max_order_notional_usdc=%s",
+                "🚨 Hyperliquid execution mode | mode=live | real_orders_enabled=yes | signer=%s | account=%s | vault=%s | "
+                "using_vault=%s | live_size_cap=%s | max_order_notional_usdc=%s",
+                _mask_address(self.signer_address) if self.signer_address else "missing",
                 _mask_address(self.account_address),
                 _mask_address(self.vault_address) if self.vault_address else "none",
+                "yes" if using_vault else "no",
                 f"{self.live_initial_size_multiplier_cap:.2f}",
                 f"{self.live_max_order_notional_usdc:.2f}",
             )
@@ -693,12 +741,12 @@ class HyperliquidClient:
                 details.append(text)
 
         def walk(value: Any, depth: int = 0) -> None:
-            if depth > 4 or len(details) >= 8:
+            if depth > 5 or len(details) >= 10:
                 return
             if isinstance(value, dict):
                 for key, item in value.items():
                     key_lower = str(key).lower()
-                    if key_lower in {"error", "message", "msg", "detail", "status"} and not isinstance(item, (dict, list, tuple)):
+                    if key_lower in {"error", "err", "message", "msg", "detail", "response"} and not isinstance(item, (dict, list, tuple)):
                         add_detail(item)
                     walk(item, depth + 1)
                 return
@@ -708,38 +756,70 @@ class HyperliquidClient:
                 return
             if isinstance(value, str):
                 lowered = value.lower()
-                if any(token in lowered for token in ("error", "reject", "invalid", "insufficient", "cancel", "failed")):
+                if any(token in lowered for token in ("error", "reject", "invalid", "insufficient", "cancel", "failed", "margin", "notional", "reduce only")):
                     add_detail(value)
 
         response_obj = response.get("response", {})
         data = response_obj.get("data", {}) if isinstance(response_obj, dict) else {}
         statuses = data.get("statuses", []) if isinstance(data, dict) else []
+        if not statuses and isinstance(response.get("statuses"), list):
+            statuses = response.get("statuses", [])
+
+        if raw_status not in {"ok", "success"}:
+            status = status_aliases.get(raw_status, raw_status or "unknown")
+            for key in ("error", "err", "message", "msg", "detail"):
+                if key in response:
+                    add_detail(response.get(key))
+            if isinstance(statuses, list) and statuses:
+                walk(statuses)
+            else:
+                response_without_status = {key: value for key, value in response.items() if key != "status"}
+                walk(response_without_status)
+            detail = " | ".join(details[:4])
+            return status, detail
 
         if isinstance(statuses, list) and statuses:
             first = statuses[0]
             if isinstance(first, dict):
+                inline_error = first.get("error") or first.get("err")
+                if inline_error:
+                    add_detail(inline_error)
+                    walk(first)
+                    return "error", " | ".join(details[:4])
+
                 if "filled" in first:
                     filled = first.get("filled", {}) or {}
-                    avg_px = filled.get("avgPx", "")
-                    oid = filled.get("oid", "")
-                    return "filled", f"avgPx={avg_px}|oid={oid}"
+                    avg_px = _mask_error(str(filled.get("avgPx", "")).strip())
+                    oid = _mask_error(str(filled.get("oid", "")).strip())
+                    filled_qty = _mask_error(str(filled.get("totalSz") or filled.get("sz") or filled.get("filledSz") or "").strip())
+                    detail_parts = [part for part in [f"avgPx={avg_px}" if avg_px else "", f"oid={oid}" if oid else "", f"filledSz={filled_qty}" if filled_qty else ""] if part]
+                    return "filled", " | ".join(detail_parts)
+
                 if "resting" in first:
                     resting = first.get("resting", {}) or {}
-                    oid = resting.get("oid", "")
-                    return "resting", f"oid={oid}"
-                if "error" in first:
-                    return "error", str(first.get("error", "unknown_error"))
+                    oid = _mask_error(str(resting.get("oid", "")).strip())
+                    return "resting", f"oid={oid}" if oid else ""
+
+                first_status = str(first.get("status", "")).strip().lower()
+                aliased = status_aliases.get(first_status)
+                if aliased in {"error", "blocked", "filled", "resting"}:
+                    walk(first)
+                    detail = " | ".join(details[:4])
+                    return aliased, detail
+
+                walk(first)
             elif isinstance(first, str):
                 lowered = first.strip().lower()
                 if lowered and lowered not in {"ok", "success"}:
-                    return "error", first
+                    add_detail(first)
+                    return "error", " | ".join(details[:4])
 
         walk(response)
 
         if "error" in response and status == "ok":
             status = "error"
 
-        detail = " | ".join(details[:3])
+        detail = " | ".join(details[:4])
         return status, detail
 
     def place_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
