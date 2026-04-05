@@ -11,6 +11,7 @@ import psycopg2
 from psycopg2.extras import Json
 
 from app.experts.news.sources.alternative_me import AlternativeMeSource
+from app.experts.news.sources.coinjournal import CoinJournalSource
 from app.experts.news.sources.coinmarketcap import CoinMarketCapSource
 from app.experts.news.sources.cryptopanic import CryptoPanicSource
 from app.settings import Settings
@@ -67,6 +68,7 @@ class NewsExpert:
         self.cryptopanic = CryptoPanicSource(self.settings)
         self.coinmarketcap = CoinMarketCapSource(self.settings)
         self.alternative_me = AlternativeMeSource(self.settings)
+        self.coinjournal = CoinJournalSource(self.settings)
 
         self._aggregate_cache: Dict[str, Any] = {"fetched_at": 0.0, "items": []}
         self._seen_path = Path(self.settings.news_events_cache_path)
@@ -156,16 +158,31 @@ class NewsExpert:
             deduped.append(item)
         return deduped
 
+    def _fetch_source_items(self, source_name: str, source: Any) -> List[Dict[str, Any]]:
+        try:
+            items = source.fetch()
+            if isinstance(items, list):
+                return items
+            logger.warning("📰 News source returned non-list payload | source=%s", source_name)
+            return []
+        except Exception:
+            logger.exception(
+                "📰 News source failed unexpectedly | source=%s | continuing without blocking trading",
+                source_name,
+            )
+            return []
+
     def _get_items(self) -> List[Dict[str, Any]]:
         if (_now_ts() - float(self._aggregate_cache.get("fetched_at", 0.0) or 0.0)) < 30.0:
             cached_items = self._aggregate_cache.get("items")
             if isinstance(cached_items, list):
                 return cached_items
 
-        items = []
-        items.extend(self.cryptopanic.fetch())
-        items.extend(self.coinmarketcap.fetch())
-        items.extend(self.alternative_me.fetch())
+        items: List[Dict[str, Any]] = []
+        items.extend(self._fetch_source_items("cryptopanic", self.cryptopanic))
+        items.extend(self._fetch_source_items("coinmarketcap", self.coinmarketcap))
+        items.extend(self._fetch_source_items("alternative_me", self.alternative_me))
+        items.extend(self._fetch_source_items("coinjournal", self.coinjournal))
 
         deduped = self._dedupe_items(items)
         self._write_news_events(deduped)
