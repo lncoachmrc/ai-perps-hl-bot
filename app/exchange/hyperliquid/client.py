@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -62,6 +63,40 @@ def _mask_error(message: str) -> str:
     return message
 
 
+def _sanitize_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_str = str(key)
+            key_lower = key_str.lower()
+            if key_lower in {"signature", "private_key", "secret_key", "api_key"}:
+                sanitized[key_str] = "***"
+            else:
+                sanitized[key_str] = _sanitize_for_log(item)
+        return sanitized
+
+    if isinstance(value, list):
+        return [_sanitize_for_log(item) for item in value]
+
+    if isinstance(value, tuple):
+        return tuple(_sanitize_for_log(item) for item in value)
+
+    if isinstance(value, str):
+        return _mask_error(value)
+
+    return value
+
+
+def _stringify_for_log(value: Any, max_len: int = 1500) -> str:
+    try:
+        text = json.dumps(_sanitize_for_log(value), ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        text = _mask_error(repr(value))
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
 class HyperliquidClient:
     def __init__(self, dry_run: bool = True, shadow_mode: bool = True) -> None:
         self.dry_run = dry_run
@@ -70,6 +105,17 @@ class HyperliquidClient:
         self.account_address = _clean_env(os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS"))
         self.vault_address = _clean_env(os.getenv("HYPERLIQUID_VAULT_ADDRESS"))
         self.private_key = _clean_env(os.getenv("HYPERLIQUID_PRIVATE_KEY"))
+
+        if (
+            self.account_address
+            and self.vault_address
+            and self.account_address.lower() == self.vault_address.lower()
+        ):
+            logger.warning(
+                "⚠️ HYPERLIQUID_VAULT_ADDRESS equals HYPERLIQUID_ACCOUNT_ADDRESS | treating vault address as unset for direct account trading"
+            )
+            self.vault_address = ""
+
         self.read_address = self.vault_address or self.account_address
 
         self.base_equity_usdc = _safe_float(os.getenv("BASE_EQUITY_USDC"), 1000.0)
@@ -620,6 +666,7 @@ class HyperliquidClient:
     def _extract_order_status(self, response: Dict[str, Any]) -> Tuple[str, str]:
         if not isinstance(response, dict):
             return "unknown", ""
+
         raw_status = str(response.get("status", "unknown")).strip().lower()
         status_aliases = {
             "ok": "ok",
@@ -632,6 +679,38 @@ class HyperliquidClient:
             "unknown": "unknown",
         }
         status = status_aliases.get(raw_status, raw_status or "unknown")
+        details: List[str] = []
+
+        def add_detail(value: Any) -> None:
+            if value is None:
+                return
+            text = _mask_error(str(value).strip())
+            if not text:
+                return
+            if text in {"ok", "success", "unknown", "n/a"}:
+                return
+            if text not in details:
+                details.append(text)
+
+        def walk(value: Any, depth: int = 0) -> None:
+            if depth > 4 or len(details) >= 8:
+                return
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    key_lower = str(key).lower()
+                    if key_lower in {"error", "message", "msg", "detail", "status"} and not isinstance(item, (dict, list, tuple)):
+                        add_detail(item)
+                    walk(item, depth + 1)
+                return
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    walk(item, depth + 1)
+                return
+            if isinstance(value, str):
+                lowered = value.lower()
+                if any(token in lowered for token in ("error", "reject", "invalid", "insufficient", "cancel", "failed")):
+                    add_detail(value)
+
         response_obj = response.get("response", {})
         data = response_obj.get("data", {}) if isinstance(response_obj, dict) else {}
         statuses = data.get("statuses", []) if isinstance(data, dict) else []
@@ -650,7 +729,18 @@ class HyperliquidClient:
                     return "resting", f"oid={oid}"
                 if "error" in first:
                     return "error", str(first.get("error", "unknown_error"))
-        return status, ""
+            elif isinstance(first, str):
+                lowered = first.strip().lower()
+                if lowered and lowered not in {"ok", "success"}:
+                    return "error", first
+
+        walk(response)
+
+        if "error" in response and status == "ok":
+            status = "error"
+
+        detail = " | ".join(details[:3])
+        return status, detail
 
     def place_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         requested_mode = "live"
@@ -759,17 +849,19 @@ class HyperliquidClient:
             order_status, detail = self._extract_order_status(response if isinstance(response, dict) else {})
             accepted_statuses = {"filled", "resting", "ok"}
             accepted = order_status in accepted_statuses
+            response_excerpt = _stringify_for_log(response)
             error_message = ""
             if not accepted:
                 error_message = detail or f"order_status:{order_status}"
             logger.warning(
-                "🚨 Live order sent | asset=%s | action=%s | rounded_size=%s | notional_usdc=%s | order_status=%s | detail=%s",
+                "🚨 Live order exchange response | asset=%s | action=%s | rounded_size=%s | notional_usdc=%s | order_status=%s | detail=%s | response=%s",
                 plan["asset"],
                 plan["action"],
                 plan["rounded_size"],
                 f'{plan["order_notional_usdc"]:.2f}',
                 order_status,
                 detail or "n/a",
+                response_excerpt,
             )
             return {
                 "accepted": accepted,
@@ -782,13 +874,15 @@ class HyperliquidClient:
                 "error": error_message,
                 "plan": plan,
                 "response": response,
+                "response_excerpt": response_excerpt,
             }
         except Exception as exc:
             message = _mask_error(str(exc))
-            logger.error(
-                "❌ Live order failed | asset=%s | action=%s | error=%s",
+            logger.exception(
+                "❌ Live order exception | asset=%s | action=%s | error_type=%s | error=%s",
                 plan["asset"],
                 plan["action"],
+                exc.__class__.__name__,
                 message or exc.__class__.__name__,
             )
             return {
@@ -800,6 +894,7 @@ class HyperliquidClient:
                 "sent_to_exchange": False,
                 "order_status": "error",
                 "error": message or exc.__class__.__name__,
+                "error_type": exc.__class__.__name__,
                 "plan": plan,
             }
 
